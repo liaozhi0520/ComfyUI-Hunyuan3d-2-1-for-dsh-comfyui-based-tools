@@ -924,20 +924,8 @@ class Hy3D21PostprocessMesh:
     CATEGORY = "Hunyuan3D21Wrapper"
 
     def process(self, trimesh, remove_floaters, remove_degenerate_faces, reduce_faces, max_facenum, smooth_normals):
-        new_mesh = trimesh.copy()
-        if remove_floaters:
-            new_mesh = FloaterRemover()(new_mesh)
-            print(f"Removed floaters, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
-        if remove_degenerate_faces:
-            new_mesh = DegenerateFaceRemover()(new_mesh)
-            print(f"Removed degenerate faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
-        if reduce_faces:
-            new_mesh = FaceReducer()(new_mesh, max_facenum=max_facenum)
-            print(f"Reduced faces, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")
-        if smooth_normals:              
-            new_mesh.vertex_normals = Trimesh.smoothing.get_vertices_normals(new_mesh)
-        
-        return (new_mesh, )
+        return _postprocess_mesh_patched(self, trimesh, remove_floaters, remove_degenerate_faces,
+                                         reduce_faces, max_facenum, smooth_normals)
         
 class Hy3D21ExportMesh:
     @classmethod
@@ -981,6 +969,101 @@ class Hy3D21ExportMesh:
             "result": (str(output_glb_path), str(relative_path), file_3d,),
         }    
 
+# --- DSH hot patch: CPU-heavy mesh work runs in a subprocess -----------------
+# xatlas UV unwrap and pymeshlab decimation are C/C++ calls that hold the GIL
+# for tens of seconds to minutes; while they run in this process ComfyUI cannot
+# answer a single HTTP request (it looks like a dead machine). They now run in
+# a torch-free child process, so the server stays responsive. Results are
+# identical to the original in-process calls.
+_MESH_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_dsh_mesh_subproc.py")
+MESH_SUBPROC_TIMEOUT = int(os.environ.get("DSH_MESH_SUBPROC_TIMEOUT", "1800"))
+
+
+def _run_mesh_subprocess(mode, mesh, extra_args=(), label="mesh work", timeout=MESH_SUBPROC_TIMEOUT):
+    """Run one CPU-bound mesh step out of process and return its npz payload."""
+    import subprocess
+    import sys
+    import tempfile
+
+    if isinstance(mesh, Trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+
+    with tempfile.TemporaryDirectory(prefix="dshmesh_") as tmp:
+        src = os.path.join(tmp, "in.npz")
+        dst = os.path.join(tmp, "out.npz")
+        log = os.path.join(tmp, "child.log")
+        np.savez(src, vertices=np.asarray(mesh.vertices), faces=np.asarray(mesh.faces))
+        cmd = [sys.executable, "-u", _MESH_WORKER, mode, src, dst] + [str(a) for a in extra_args]
+
+        print("[mesh-subproc] %s: %d faces -> child process (timeout %ds); "
+              "this process stays responsive" % (label, len(mesh.faces), timeout), flush=True)
+        started = time.time()
+        next_tick = 30.0
+        offset = 0
+        output = b""
+        with open(log, "w+b") as fh:
+            # subprocess (fork + immediate exec) is safe after CUDA init;
+            # multiprocessing's fork start method is not.
+            proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT)
+            while proc.poll() is None:
+                fh.seek(offset)
+                chunk = fh.read()
+                if chunk:
+                    offset += len(chunk)
+                    output += chunk
+                    print(chunk.decode("utf-8", "replace").rstrip("\n"), flush=True)
+                elapsed = time.time() - started
+                if elapsed > timeout:
+                    proc.kill()
+                    proc.wait()
+                    raise RuntimeError("%s timed out after %ds - child process killed" % (label, timeout))
+                if elapsed >= next_tick:
+                    print("[mesh-subproc] ... %s still running (%.0fs)" % (label, elapsed), flush=True)
+                    next_tick += 30.0
+                time.sleep(1.0)
+            fh.seek(offset)
+            rest = fh.read()
+            if rest:
+                output += rest
+                print(rest.decode("utf-8", "replace").rstrip("\n"), flush=True)
+
+        if proc.returncode != 0:
+            raise RuntimeError("%s child process failed (rc=%d):\n%s"
+                               % (label, proc.returncode,
+                                  output.decode("utf-8", "replace")[-1000:]))
+        data = np.load(dst)
+        print("[mesh-subproc] %s done in %.1fs" % (label, time.time() - started), flush=True)
+        return data
+
+
+def _mesh_uv_wrap_isolated(mesh, timeout=MESH_SUBPROC_TIMEOUT):
+    """Subprocess version of hy3dpaint.utils.uvwrap_utils.mesh_uv_wrap."""
+    from trimesh.visual import TextureVisuals
+
+    data = _run_mesh_subprocess("uvwrap", mesh, label="UV wrap", timeout=timeout)
+    return Trimesh.Trimesh(vertices=data["vertices"], faces=data["faces"],
+                           visual=TextureVisuals(uv=data["uv"]), process=False)
+
+
+def _mesh_postprocess_isolated(mesh, remove_floaters, remove_degenerate_faces, reduce_faces,
+                               max_facenum, timeout=MESH_SUBPROC_TIMEOUT):
+    """Subprocess version of Hy3D21PostprocessMesh's pymeshlab chain."""
+    args = ("--remove-floaters=%d" % int(bool(remove_floaters)),
+            "--remove-degenerate=%d" % int(bool(remove_degenerate_faces)),
+            "--reduce-faces=%d" % int(bool(reduce_faces)),
+            "--max-facenum=%d" % int(max_facenum))
+    data = _run_mesh_subprocess("postprocess", mesh, args, label="postprocess", timeout=timeout)
+    return Trimesh.Trimesh(vertices=data["vertices"], faces=data["faces"], process=False)
+
+
+def _postprocess_mesh_patched(self, trimesh, remove_floaters, remove_degenerate_faces, reduce_faces,
+                              max_facenum, smooth_normals):
+    new_mesh = _mesh_postprocess_isolated(trimesh, remove_floaters, remove_degenerate_faces,
+                                          reduce_faces, max_facenum)
+    if smooth_normals:
+        new_mesh.vertex_normals = Trimesh.smoothing.get_vertices_normals(new_mesh)
+    return (new_mesh, )
+# --- /DSH hot patch ---------------------------------------------------------
 class Hy3D21MeshUVWrap:
     @classmethod
     def INPUT_TYPES(s):
@@ -996,7 +1079,7 @@ class Hy3D21MeshUVWrap:
     CATEGORY = "Hunyuan3D21Wrapper"
 
     def process(self, trimesh):
-        trimesh = mesh_uv_wrap(trimesh)
+        trimesh = _mesh_uv_wrap_isolated(trimesh)
         
         return (trimesh,)        
         
