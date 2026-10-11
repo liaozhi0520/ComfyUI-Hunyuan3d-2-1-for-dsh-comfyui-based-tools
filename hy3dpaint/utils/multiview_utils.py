@@ -25,6 +25,31 @@ from diffusers import EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMulti
 from ..hunyuanpaintpbr.pipeline import HunyuanPaintPipeline
 
 
+
+
+def _resolve_local_paint_dir(subdir):
+    """Prefer the provisioned local copy under ComfyUI/models/hunyuan3d/paint/.
+
+    The dsh provision script downloads the paint weights there (with endpoint
+    selection and hash verification). Returns None when absent so callers fall
+    back to the HuggingFace runtime download.
+    """
+    try:
+        import folder_paths
+    except Exception:
+        return None
+    candidate = os.path.join(folder_paths.models_dir, "hunyuan3d", "paint", subdir)
+    return candidate if os.path.isdir(candidate) else None
+
+
+def _snapshot_download_subdir(repo_id, subdir):
+    """HuggingFace fallback: download (or reuse the cache) and return the subdir path."""
+    return os.path.join(
+        huggingface_hub.snapshot_download(repo_id=repo_id, allow_patterns=[subdir + "/*"]),
+        subdir,
+    )
+
+
 class multiviewDiffusionNet:
     def __init__(self, config) -> None:
         self.device = config.device
@@ -35,12 +60,13 @@ class multiviewDiffusionNet:
         self.cfg = cfg
         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
 
-        model_path = huggingface_hub.snapshot_download(
-            repo_id=config.multiview_pretrained_path,
-            allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
-        )
-
-        model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
+        model_path = _resolve_local_paint_dir("hunyuan3d-paintpbr-v2-1")
+        if model_path is not None:
+            print(f"[hy3dpaint] Using provisioned local paint weights: {model_path}")
+        else:
+            print("[hy3dpaint] Local paint weights not found under models/hunyuan3d/paint/, "
+                  f"downloading via HuggingFace ({config.multiview_pretrained_path})")
+            model_path = _snapshot_download_subdir(config.multiview_pretrained_path, "hunyuan3d-paintpbr-v2-1")
                 
         pipeline = HunyuanPaintPipeline.from_pretrained(
             model_path,
@@ -60,7 +86,13 @@ class multiviewDiffusionNet:
 
         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
             from ..hunyuanpaintpbr.unet.modules import Dino_v2
-            self.dino_v2 = Dino_v2(config.dino_ckpt_path).to(torch.float16)
+            dino_local = _resolve_local_paint_dir("dinov2-giant")
+            if dino_local is not None:
+                print(f"[hy3dpaint] Using provisioned local DINOv2 weights: {dino_local}")
+                dino_ckpt_path = dino_local
+            else:
+                dino_ckpt_path = config.dino_ckpt_path
+            self.dino_v2 = Dino_v2(dino_ckpt_path).to(torch.float16)
             self.dino_v2 = self.dino_v2.to(self.device)
 
     def seed_everything(self, seed):
